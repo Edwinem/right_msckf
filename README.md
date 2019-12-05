@@ -36,25 +36,29 @@ Main purpose is to serve as a reference for people that want to implement a MSCK
  
  
  ## References
- 
+
+    1)
     @article{Mourikis2007a,
       author = {Mourikis, Anastasios I. and Roumeliotis, Stergios I.},
       title = {{A multi-state constraint Kalman filter for vision-aided inertial navigation}},
       year = {2007}
       }
 
+    2)
     @techreport{JoanSola2012,
     author = {{Joan Sol{\'{a}}}},
     title = {{Quaternion Kinematics for Error-State KF}},
     year = {2012}
     }
     
+    3)
     @article{Li2012,
     author = {Li, Mingyang and Mourikis, Anastasios I.},
     title = {{Improving the accuracy of EKF-based visual-inertial odometry}},
     year = {2012}
     }
     
+    4)
     @article{Sommer2018,
     author = {Sommer, Hannes and Gilitschenski, Igor and Bloesch, Michael and Weiss, Stephan and Siegwart, Roland and Nieto, Juan},
     title = {{Why and how to avoid the flipped quaternion multiplication}},
