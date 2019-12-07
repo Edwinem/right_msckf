@@ -7,25 +7,11 @@
 #include <unordered_set>
 #include <vector>
 #include <list>
+#include <deque>
+
+#include "core.h"
 
 namespace msckf {
-
-using Vec3d=Eigen::Vector3d;
-using Vec2d=Eigen::Vector2d;
-using Vec6d=Eigen::Matrix<double, 6, 1>;
-using VecXd=Eigen::Matrix<double, Eigen::Dynamic, 1>;
-using Mat33d=Eigen::Matrix3d;
-using Mat66d=Eigen::Matrix<double, 6, 6>;
-using MatXd=Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic>;
-
-using Mat15x15d=Eigen::Matrix<double, 15, 15>;
-using Mat15x12d=Eigen::Matrix<double, 15, 12>;
-
-const double deg2rad = M_PI / 180;
-
-Mat33d CreateSkew(const Vec3d &input);
-
-Eigen::Quaterniond RotVec2Quat(const Vec3d &rot_vec);
 
 struct IMUMeas {
   Vec3d acc;
@@ -43,6 +29,7 @@ struct Landmark {
 
   int64_t id = 0; // same as Feature
   std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> projs;
+  std::vector<int64_t> camera_ids;
 
   int64_t cam_id_first;
   int64_t cam_id_last;
@@ -68,6 +55,11 @@ struct CamState {
 
 };
 
+struct Landmark_To_Residualize {
+  Landmark landmark;
+  std::unordered_map<int64_t, CamState> connected_cams;
+};
+
 struct State {
 
   int num_cam_clones;
@@ -78,10 +70,13 @@ struct State {
 
   MatXd imu_covar; //covariance of quat-imu_pos
   MatXd cams_covar;
+  
+  
+  MatXd imu_cam_covar;
 
   MatXd P;
 
-  std::list<CamState> cam_states;
+  std::deque<CamState> cam_states;
 
   //state indexes to get values
   const int quat_idx = 0;
@@ -131,11 +126,13 @@ public:
 
   int max_track_length = 10;
 
+  double total_time = 0;
+
   // ---------------------------- IMU ---------------------------------------------------
-  double sigma_gyr{1e-4};
-  double sigma_acc{1e-2};
-  double sigma_bg_drift{3.6733e-5};
-  double sigma_ba_drift{7e-4};
+  double sigma_gyr_2 = Square(1e-4);
+  double sigma_acc_2 = Square(1e-2);
+  double sigma_bg_drift_2 = Square(3.6733e-5);
+  double sigma_ba_drift_2 = Square(7e-4);
   double tau_bg{50.0};
   double tau_ba{100.0};
 
@@ -288,9 +285,15 @@ public:
 
     G_k.block<3, 3>(0, 0) = Mat33d::Identity();
 
-    MatXd Q(12, 12);
+    MatXd Qc(12, 12);
 
-    MatXd P = Phi * state.imu_covar * Phi.transpose() + G_k * Q * G_k.transpose();
+    double dt2 = dt * dt; //According to Sola
+    Qc.block(0, 0, 3, 3) = sigma_gyr_2 / dt2 * Eigen::Matrix<double, 3, 3>::Identity();
+    Qc.block(3, 3, 3, 3) = sigma_bg_drift_2 / dt * Eigen::Matrix<double, 3, 3>::Identity();
+    Qc.block(6, 6, 3, 3) = sigma_acc_2 / dt2 * Eigen::Matrix<double, 3, 3>::Identity();
+    Qc.block(9, 9, 3, 3) = sigma_ba_drift_2 / dt * Eigen::Matrix<double, 3, 3>::Identity();
+
+    MatXd P = Phi * state.imu_covar * Phi.transpose() + G_k * Qc * G_k.transpose();
 
   }
 
@@ -339,42 +342,203 @@ public:
 
   }
 
-  bool CheckLandMarkValidity(const Landmark &l) {
-    return false;
+  bool CheckLandMarkValidity(const Landmark_To_Residualize &l) {
+    return true;
   }
 
   void Marginilize() {
+
+    int total_obs = 0;
+
     if (feature_ids_to_remove.size() == 0) {
       return;
     }
+
+    std::vector<Landmark_To_Residualize> valid_tracks;
 
     for (const auto feature_id:feature_ids_to_remove) {
       auto iter = map_id_landmark.find(feature_id);
       assert(iter != map_id_landmark.end());
 
-      Landmark m(std::move(iter->second));
+      Landmark_To_Residualize track;
 
+      Landmark l = std::move(iter->second);
       map_id_landmark.erase(iter);
 
-      bool valid = CheckLandMarkValidity(m);
+
+
+
+
+      //Find all cameras connected to this landmark. Also remove any projections that don't have a camera state.
+      // This can happen if the camera state has been pruned
+      std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> valid_projs;
+      std::vector<int64_t> valid_cam_ids;
+      for (int idx = 0; idx < l.camera_ids.size(); ++idx) {
+        int cam_id = l.camera_ids[idx];
+        for (auto &cam:state.cam_states) {
+          if (cam_id == cam.cam_id) {
+            valid_projs.emplace_back(l.projs[idx]);
+            valid_cam_ids.emplace_back(cam_id);
+            track.connected_cams[cam.cam_id] = cam;
+            break;
+          }
+
+        }
+      }
+
+      //Copy over landmark info and valid projs to track
+      track.landmark = l;
+      track.landmark.projs = valid_projs;
+      track.landmark.camera_ids = valid_cam_ids;
+
+      bool valid = CheckLandMarkValidity(track);
 
       if (!valid) {
         continue;
       }
 
+      bool triang_result = TriangulateFeature(track);
+
+      if (triang_result) {
+        valid_tracks.push_back(track);
+      }
+
     }
+
+    if (valid_tracks.empty()) {
+      return;
+    }
+
+    int num_valid = valid_tracks.size();
+
+    MatXd H_o = MatXd::Zero(2 * total_obs - 3 * num_valid,
+                            15 + 6 * state.cam_states.size());
+    MatXd R_o = MatXd::Zero(2 * total_obs - 3 * num_valid,
+                            2 * total_obs - 3 * num_valid);
+    VecXd r_o(2 * total_obs - 3 * num_valid);
+
+    for (auto &track:valid_tracks) {
+
+      //Calculate Residual
+
+      std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> residuals = ComputeTrackResidual(track);
+
+      MatXd H_o_j, A;
+
+      ComputeJacobians(track);
+
+    }
+
   }
+
+  std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> ComputeTrackResidual(Landmark_To_Residualize &track) {
+
+    std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> residuals(track.landmark.projs.size());
+
+    int iter = 0;
+    for (int idx = 0; idx < track.landmark.projs.size(); ++idx) {
+      const auto &obs = track.landmark.projs[idx];
+      auto cam_id = track.landmark.camera_ids[idx];
+
+      const Vec3d &pt3D = track.landmark.pos_W;
+      const auto &cam_state = track.connected_cams[cam_id];
+
+      Mat44d T_wc = BuildTransform(cam_state.quat, cam_state.pos);
+      Mat44d T_cw = InvertTransform(T_wc);
+      Vec3d p_f_C = T_wc.block<3, 3>(0, 0) * pt3D + T_wc.block<3, 1>(0, 3);
+      Vec2d projection = p_f_C.template head<2>() / p_f_C(2);
+
+      residuals[idx] = obs - projection;
+    }
+
+    return residuals;
+  }
+
+  void ComputeJacobians(Landmark_To_Residualize &track) {
+
+    int n_obs = track.landmark.projs.size();
+
+    MatXd H_f_j = MatXd::Zero(2 * n_obs, 3);
+    MatXd H_x_j =
+        MatXd::Zero(2 * n_obs, 15 + 6 * state.cam_states.size());
+
+    for (int c_i = 0; c_i < n_obs; c_i++) {
+      const int64_t cam_id = track.landmark.camera_ids[c_i];
+
+      const Vec3d &pt3D = track.landmark.pos_W;
+      const auto &camera_state = track.connected_cams[cam_id];
+
+      Vec3d p_f_C = camera_state.quat.toRotationMatrix() *
+          (pt3D - camera_state.pos);
+
+      double X, Y, Z;
+
+      X = p_f_C(0);
+      Y = p_f_C(1);
+      Z = p_f_C(2);
+
+      //See Jacobian in MSCKF paper. Also is same in VINS-Mono Projection Factor
+      Eigen::Matrix<double, 2, 3> J_i;
+      J_i << 1, 0, -X / Z,
+             0, 1, -Y / Z;
+      J_i *= 1 / Z;
+
+
+
+      // P_c= T_cw*P_w and T_cw= T_ci*T_iw
+      // P_c = R_cw*P_w+ t_wc
+      //
+
+      Eigen::Matrix<double, 3, 6> dPcam_dstate = Eigen::Matrix<double, 3, 6>::Zero();
+
+      // Jacobian w.r.t. Camera Orientation
+      dPcam_dstate.leftCols(3) = -camera_state.quat.toRotationMatrix() * CreateSkew(camera_state.pos);
+
+      // Jacobian w.r.t. Camera Position
+      dPcam_dstate.rightCols(3) = -camera_state.quat.toRotationMatrix();
+
+
+//      // Enforce observability constraint, see propagation for citation
+//      Eigen::Matrix<double,2,6> A;
+//      A << J_i * vectorToSkewSymmetric(p_f_C),
+//          -J_i * cam_states_[index].q_CG.toRotationMatrix();
+//
+//      Eigen::Matrix<double,6,1> u = Matrix<_S, 6, 1>::Zero();
+//      u.head(3) = cam_states_[index].q_CG.toRotationMatrix() * imu_state_.g;
+//      Vector3<_S> tmp = p_f_G - cam_states_[index].p_C_G;
+//      u.tail(3) = vectorToSkewSymmetric(tmp) * imu_state_.g;
+//
+//      Matrix<_S, 2, 6> H_x =
+//          A - A * u * (u.transpose() * u).inverse() * u.transpose();
+//      Matrix<_S, 2, 3> H_f = -H_x.template block<2, 3>(0, 3);
+//      H_f_j.template block<2, 3>(2 * c_i, 0) = H_f;
+//
+//      // Potential indexing problem zone
+//      H_x_j.template block<2, 6>(2 * c_i, 15 + 6 * (index)) = H_x;
+//    }
+//
+//    int jacobian_row_size = 2 * camStateIndices.size();
+//
+//    JacobiSVD<MatrixX<_S>> svd_helper(H_f_j, ComputeFullU | ComputeThinV);
+//    A_j = svd_helper.matrixU().rightCols(jacobian_row_size - 3);
+//
+//    H_o_j = A_j.transpose() * H_x_j;
+    }
+
+  }
+
+  bool TriangulateFeature(Landmark_To_Residualize &track);
 
   /*
   void MeasurementUpdate(const MatXd &H_o, const MatXd &r_o, const MatXd &R_o) {
     if (r_o.size() != 0) {
       // Build MSCKF covariance matrix
-      MatXd P = MatXd::Zero(15 + cam_covar_.rows(), 15 + cam_covar_.cols());
-      P.template block<15, 15>(0, 0) = imu_covar_;
-      if (cam_covar_.rows() != 0) {
-        P.block(0, 15, 15, imu_cam_covar_.cols()) = imu_cam_covar_;
-        P.block(15, 0, imu_cam_covar_.cols(), 15) = imu_cam_covar_.transpose();
-        P.block(15, 15, cam_covar_.rows(), cam_covar_.cols()) = cam_covar_;
+      MatXd P = MatXd::Zero(15 + state.cams_covar.rows(), 15 + state.cams_covar.cols());
+      P.template block<15, 15>(0, 0) = state.imu_covar;
+      if (state.cams_covar.rows() != 0) {
+        P.block(0, 15, 15, state.imu_cam_covar.cols()) = state.imu_cam_covar;
+        P.block(15, 0, state.imu_cam_covar.cols(), 15) = state.imu_cam_covar.transpose();
+        P.block(15, 15, state.cams_covar.rows(), state.cams_covar.cols()) = state.cams_covar;
       }
 
       MatXd T_H, Q_1, R_n;
@@ -382,9 +546,9 @@ public:
 
       // Put residuals in update-worthy form
       // Calculates T_H matrix according to Mourikis 2007
-      HouseholderQR <MatXd> qr(H_o);
+      Eigen::HouseholderQR <MatXd> qr(H_o);
       MatXd Q = qr.householderQ();
-      MatXd R = qr.matrixQR().template triangularView<Upper>();
+      MatXd R = qr.matrixQR().template triangularView<Eigen::Upper>();
 
       VecXd nonZeroRows = R.rowwise().any();
       int numNonZeroRows = nonZeroRows.sum();
@@ -414,65 +578,73 @@ public:
       // State Correction
       VecXd deltaX = K * r_n;
 
-      // Update IMU state (from updateState matlab function defined in MSCKF.m)
-      Quaterniond q_IG_up = buildUpdateQuat(deltaX.template head<3>()) * imu_state_.q_IG;
-
-      imu_state_.q_IG = q_IG_up;
-
-      imu_state_.b_g += deltaX.template segment<3>(3);
-      imu_state_.b_a += deltaX.template segment<3>(9);
-      imu_state_.v_I_G += deltaX.template segment<3>(6);
-      imu_state_.p_I_G += deltaX.template segment<3>(12);
-
-      // Update Camera<_S> states
-      for (size_t c_i = 0; c_i < cam_states_.size(); c_i++) {
-        Quaterniond q_CG_up = buildUpdateQuat(deltaX.template segment<3>(15 + 6 * c_i)) *
-            cam_states_[c_i].q_CG;
-        cam_states_[c_i].q_CG = q_CG_up.normalized();
-        cam_states_[c_i].p_C_G += deltaX.template segment<3>(18 + 6 * c_i);
-      }
-
-      // Covariance correction
-      MatXd tempMat = MatXd::Identity(15 + 6 * cam_states_.size(),
-                                      15 + 6 * cam_states_.size()) -
-          K * T_H;
-
-      MatXd P_corrected, P_corrected_transpose;
-      P_corrected = tempMat * P * tempMat.transpose() + K * R_n * K.transpose();
-      // Enforce symmetry
-      P_corrected_transpose = P_corrected.transpose();
-      P_corrected += P_corrected_transpose;
-      P_corrected /= 2;
-
-      if (P_corrected.rows() - 15 != cam_covar_.rows()) {
-        std::cout << "[P:" << P_corrected.rows() << "," << P_corrected.cols() << "]";
-        std::cout << "[cam_covar_:" << cam_covar_.rows() << "," << cam_covar_.cols() << "]";
-        std::cout << std::endl;
-      }
-
-      // TODO : Verify need for eig check on P_corrected here (doesn't seem too
-      // important for now)
-      imu_covar_ = P_corrected.template block<15, 15>(0, 0);
-
-      // TODO: Check here
-      cam_covar_ = P_corrected.block(15, 15, P_corrected.rows() - 15,
-                                     P_corrected.cols() - 15);
-      imu_cam_covar_ = P_corrected.block(0, 15, 15, P_corrected.cols() - 15);
+//      // Update IMU state (from updateState matlab function defined in MSCKF.m)
+//      Eigen::Quaterniond q_IG_up = buildUpdateQuat(deltaX.template head<3>()) * state..q_IG;
+//
+//      imu_state_.q_IG = q_IG_up;
+//
+//      imu_state_.b_g += deltaX.template segment<3>(3);
+//      imu_state_.b_a += deltaX.template segment<3>(9);
+//      imu_state_.v_I_G += deltaX.template segment<3>(6);
+//      imu_state_.p_I_G += deltaX.template segment<3>(12);
+//
+//      // Update Camera<_S> states
+//      for (size_t c_i = 0; c_i < cam_states_.size(); c_i++) {
+//        Quaterniond q_CG_up = buildUpdateQuat(deltaX.template segment<3>(15 + 6 * c_i)) *
+//            cam_states_[c_i].q_CG;
+//        cam_states_[c_i].q_CG = q_CG_up.normalized();
+//        cam_states_[c_i].p_C_G += deltaX.template segment<3>(18 + 6 * c_i);
+//      }
+//
+//      // Covariance correction
+//      MatXd tempMat = MatXd::Identity(15 + 6 * cam_states_.size(),
+//                                      15 + 6 * cam_states_.size()) -
+//          K * T_H;
+//
+//      MatXd P_corrected, P_corrected_transpose;
+//      P_corrected = tempMat * P * tempMat.transpose() + K * R_n * K.transpose();
+//      // Enforce symmetry
+//      P_corrected_transpose = P_corrected.transpose();
+//      P_corrected += P_corrected_transpose;
+//      P_corrected /= 2;
+//
+//      if (P_corrected.rows() - 15 != state.cams_covar.rows()) {
+//        std::cout << "[P:" << P_corrected.rows() << "," << P_corrected.cols() << "]";
+//        std::cout << "[state.cams_covar:" << state.cams_covar.rows() << "," << state.cams_covar.cols() << "]";
+//        std::cout << std::endl;
+//      }
+//
+//      // TODO : Verify need for eig check on P_corrected here (doesn't seem too
+//      // important for now)
+//      state.imu_covar = P_corrected.template block<15, 15>(0, 0);
+//
+//      // TODO: Check here
+//      state.cams_covar = P_corrected.block(15, 15, P_corrected.rows() - 15,
+//                                     P_corrected.cols() - 15);
+//      state.imu_cam_covar = P_corrected.block(0, 15, 15, P_corrected.cols() - 15);
 
       return;
     } else
       return;
   }
-
-   */
+*/
+   
   void AugmentState() {
 
     int n_cams = state.cam_states.size();
 
-    Eigen::Quaterniond cam_quat = state.GetQuat() * q_IMU_C; //
-    cam_quat.normalize();
 
-    Vec3d cam_pose = state.GetPos() + q_IMU_C * p_IMU_C;
+    // T_wc = T_wi*T_ic
+    // w=world,c=camera,i=imu/body
+    // T=Rt
+
+    // From above
+    // Q_wc=Q_wi*Q_ic
+    Eigen::Quaterniond cam_quat = state.GetQuat() * q_IMU_C; //
+    cam_quat.normalize(); // ensure it is unit quaternion
+
+    // t_wc= t_wi+ R_wi*t_ic
+    Vec3d cam_pose = state.GetPos() + state.GetQuat() * p_IMU_C;
 
     CamState cam;
 
@@ -495,27 +667,31 @@ public:
     }
 
 
-    //Size is 6 since minimal Jacobian pose is 6(pos=3,quat=3)
+    //Size is 6 since minimal Jacobian pose is 6(quat=3,pos=3)
 
     MatXd Jac = MatXd::Zero(6, 15 + 6 * state.cam_states.size());
 
 
     //Follows the format seen in Mourikis MSCKF Eq 16
-    //Jacobians are with Body to Earth
+    //Jacobians are with Body to Earth using Q_wc=Q_wi*Q_ic and t_wc= t_wi+ R_wi*t_ic
 
-    //Quaternion Jacs
-
-    Jac.block<3, 3>(0, 0) = q_IMU_C.toRotationMatrix();
 
 
 
-    //Jac of position w.r.t position
-    Jac.block<3, 3>(3, state.pos_error_idx) = Mat33d::Identity();
+    //Quaternion Jacs
+    // Jac of cam_quat w.r.t imu_quat
+    Jac.block<3, 3>(0, state.quat_error_idx) = q_IMU_C.toRotationMatrix();
 
-    Mat33d s = CreateSkew(p_IMU_C);
-    //Jac of position with respect to Body-Cam rotation eq cam_P=body_P+R_BC*IMU_CAM_P
+
+    //Position Jac
+
+    //Jac of cam_position with respect to imu_quat d/dR(R_wi*t_ic)
     //derivative of this can be found in Bloesh primer
+    Mat33d s = CreateSkew(p_IMU_C);
     Jac.block<3, 3>(3, state.quat_error_idx) = -state.GetQuat().toRotationMatrix() * s;
+
+    //Jac of cam_position w.r.t position
+    Jac.block<3, 3>(3, state.pos_error_idx) = Mat33d::Identity();
 
     MatXd tempMat = MatXd::Identity(15 + 6 * n_cams + 6,
                                     15 + 6 * n_cams);

@@ -15,7 +15,7 @@ add_library(right_msckf
         src/vio_simulator.cpp
         src/b3_spline.h
         src/b3_spline.cpp
-        )
+        src/core.cpp src/core.h)
 
 
 
