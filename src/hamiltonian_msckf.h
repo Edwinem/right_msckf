@@ -462,6 +462,11 @@ public:
     MatXd H_x_j =
         MatXd::Zero(2 * n_obs, 15 + 6 * state.cam_states.size());
 
+
+    Mat33d R_wi=state.GetQuat().toRotationMatrix(); //Rotation of IMU from World
+    Mat33d R_ic=q_IMU_C.toRotationMatrix(); //Rotation of Camera from IMU
+
+
     for (int c_i = 0; c_i < n_obs; c_i++) {
       const int64_t cam_id = track.landmark.camera_ids[c_i];
 
@@ -492,10 +497,13 @@ public:
       Eigen::Matrix<double, 3, 6> dPcam_dstate = Eigen::Matrix<double, 3, 6>::Zero();
 
       // Jacobian w.r.t. Camera Orientation
-      dPcam_dstate.leftCols(3) = -camera_state.quat.toRotationMatrix() * CreateSkew(camera_state.pos);
+      dPcam_dstate.leftCols(3) = R_ic.transpose()*R_wi.transpose()* -CreateSkew(camera_state.pos);
 
       // Jacobian w.r.t. Camera Position
-      dPcam_dstate.rightCols(3) = -camera_state.quat.toRotationMatrix();
+      dPcam_dstate.rightCols(3) = -(R_ic.transpose()*R_wi.transpose());
+
+
+      MatXd Jac=J_i*dPcam_dstate;
 
 
 //      // Enforce observability constraint, see propagation for citation
