@@ -70,8 +70,7 @@ struct State {
 
   MatXd imu_covar; //covariance of quat-imu_pos
   MatXd cams_covar;
-  
-  
+
   MatXd imu_cam_covar;
 
   MatXd P;
@@ -163,6 +162,8 @@ public:
   double sigma_vo_fv_ad{0.01};
   VecXd error_vo_pred{VecXd::Zero(2, 1)};
 
+  bool use_observability_augmentation = false;
+
 
   //================================ MSC EKF Necessary Matrices ==========================================================
 
@@ -196,7 +197,9 @@ public:
 
   std::unordered_set<int64_t> feature_ids_to_remove;
 
-  void Propogate(const IMUMeas &meas, double dt) {
+  double noise_pixel_sigma;
+
+  void Propogate(const IMUMeas& meas, double dt) {
 
     Vec3d acc_meas = meas.acc;
     Vec3d gyro_meas = meas.gyro;
@@ -225,9 +228,85 @@ public:
 
   void Update();
 
+  void PropogateStateRK4(State& x, Vec3d& unbiased_acc, Vec3d& unbiased_gyro, Vec3d& gravity, double dt) {
+
+
+    // Current state
+    Eigen::Quaterniond q0 = state.GetQuat();
+    Vec3d pos0 = state.GetPos();
+    Vec3d vel0 = state.GetVel();
+    Mat33d Rwb0 = q0.toRotationMatrix();
+
+    //RK4
+
+    //q_dot=0.5*q*w=0.5*omega(w)*q
+    // v_dot=R*(acc_m-acc_b)+gravity
+    // p_dot=v
+
+    //k1
+    Vec4d q1_dot = 0.5 * OmegaEigenQuat(unbiased_gyro) * q0.coeffs();
+    Vec3d p1_dot = vel0;
+    Vec3d v1_dot = Rwb0 * (unbiased_acc) + gravity;
+
+    Vec4d q_k1 = q1_dot * dt;
+    Vec3d p_k1 = p1_dot * dt;
+    Vec3d v_k1 = v1_dot * dt;
+
+    Vec4d q1 = q0.coeffs() + q_k1 * 0.5;
+    Vec3d v1 = vel0 + v_k1 * 0.5;
+//
+    Eigen::Quaterniond q1_eig(q1.data());
+    q1_eig.normalize();
+//
+//    //k2
+    Vec4d q2_dot = 0.5 * OmegaEigenQuat(unbiased_gyro) * q1_eig.coeffs();
+    Vec3d p2_dot = v1;
+    Vec3d v2_dot = q1_eig.toRotationMatrix() * unbiased_acc + gravity;
+
+    Vec4d q_k2 = q2_dot * dt;
+    Vec3d p_k2 = p2_dot * dt;
+    Vec3d v_k2 = v2_dot * dt;
+
+    Vec4d q2 = q0.coeffs() + q_k2 * 0.5;
+    Vec3d v2 = vel0 + v_k2 * 0.5;
+//
+    Eigen::Quaterniond q2_eig(q2.data());
+    q2_eig.normalize();
+    //k3
+    Vec4d q3_dot = 0.5 * OmegaEigenQuat(unbiased_gyro) * q2_eig.coeffs();
+    Vec3d p3_dot = v2;
+    Vec3d v3_dot = q2_eig.toRotationMatrix() * unbiased_acc + gravity;
+
+    Vec4d q_k3 = q3_dot * dt;
+    Vec3d p_k3 = p3_dot * dt;
+    Vec3d v_k3 = v3_dot * dt;
+
+    Vec4d q3 = q0.coeffs() + q_k3;
+    Vec3d v3 = vel0 + v_k3;
+
+    Eigen::Quaterniond q3_eig(q3.data());
+    q3_eig.normalize();
+
+    Vec4d q4_dot = 0.5 * OmegaEigenQuat(unbiased_gyro) * q3_eig.coeffs();
+    Vec3d p4_dot = v3;
+    Vec3d v4_dot = q3_eig.toRotationMatrix() * unbiased_acc + gravity;
+
+    Vec4d q_k4 = q4_dot * dt;
+    Vec3d p_k4 = p4_dot * dt;
+    Vec3d v_k4 = v4_dot * dt;
+
+
+    // Sum
+
+    Vec3d p = pos0 + (1 / 6.0) * (p_k1 + 2 * p_k2 + 2 * p_k3 + p_k4);
+    Vec3d v = vel0 + (1 / 6.0) * (v_k1 + 2 * v_k2 + 2 * v_k3 + v_k4);
+    Vec4d q = q0.coeffs() + (1 / 6.0) * (q_k1 + 2 * q_k2 + 2 * q_k3 + q_k4);
+    Eigen::Quaterniond q_eig(q.data());
+  }
+
   void
-  CalcIMUDerivatives(State &x, Vec3d &pos_dx, Vec3d &vel_dx, Eigen::Quaterniond &quat_dx, Vec3d &unbiased_acc,
-                     Vec3d &unbiased_gyro) {
+  CalcIMUDerivatives(State& x, Vec3d& pos_dx, Vec3d& vel_dx, Eigen::Quaterniond& quat_dx, Vec3d& unbiased_acc,
+                     Vec3d& unbiased_gyro) {
     // From equations 236 in Sola Page 54
 
     pos_dx = x.GetVel();
@@ -235,9 +314,46 @@ public:
     //quat_dx=x.GetQuat()*unbiased_gyro*0.5;
 
 
+
+
+
+//    Vec3 gyro = gyro_accel.head<3>();
+//    Vec3 accel = gyro_accel.tail<3>();
+//
+//    Vec3 gyro_calib = imu_.Cg() * gyro - X.bg;   // \hat\omega in the doc
+//    Vec3 accel_calib = imu_.Ca() * accel - X.ba; // \hat\alpha in the doc
+//
+//    // jacobian w.r.t. error state
+//    Mat3 R = X.Rsb.matrix();
+//
+//    Eigen::Matrix<number_t, 3, 9> dW_dCg;
+//    for (int i = 0; i < 3; ++i) {
+//      // NOTE: use the raw measurement (gyro) here. NOT the calibrated one
+//      // (gyro_calib)!!!
+//      dW_dCg.block<1, 3>(i, 3 * i) = gyro;
+//    }
+//
+//    Eigen::Matrix<number_t, 3, 9> dV_dRCa = dAB_dA<3, 3>(accel);
+//    Eigen::Matrix<number_t, 9, 9> dRCa_dCafm = dAB_dB<3, 3>(R); // fm: full matrix
+//    Eigen::Matrix<number_t, 9, 6> dCafm_dCa = dA_dAu<number_t, 3>(); // full matrix w.r.t. upper triangle
+//    Eigen::Matrix<number_t, 3, 6> dV_dCa = dV_dRCa * dRCa_dCafm * dCafm_dCa;
+//
+//    Mat3 dW_dW = -hat(gyro_calib);
+//    // static Mat3 dW_dbg = -I3;
+//
+//    // static Mat3 dT_dV = I3;
+//
+//    Mat3 dV_dW = -R * hat(accel_calib);
+//    Mat3 dV_dba = -R;
+//
+//    Mat3 dV_dWg = -R * hat(g_); // effective dimension: 3x2, since Wg is 2-dim
+//    // Mat2 dWg_dWg = Mat2::Identity();
+
+
+
   }
 
-  void CalcProcessCovDerivatives(State &x, MatXd &F, Vec3d &unbiased_acc, Vec3d &unbiased_gyro) {
+  void CalcProcessCovDerivatives(State& x, MatXd& F, Vec3d& unbiased_acc, Vec3d& unbiased_gyro) {
 
     MatXd F_k(18, 18);
 
@@ -248,27 +364,28 @@ public:
 
     F_k.setZero();
 
-    //All the Identity jacobians
-    F_k.block<3, 3>(x.pos_error_idx, x.pos_error_idx) = Mat33d::Identity();
-    F_k.block<3, 3>(x.vel_error_idx, x.vel_error_idx) = Mat33d::Identity();
-    F_k.block<3, 3>(x.bg_error_idx, x.ba_error_idx) = Mat33d::Identity();
-    F_k.block<3, 3>(x.ba_error_idx, x.ba_error_idx) = Mat33d::Identity();
 
 
-    //Velocity Jacobians
+    // Velocity Jacobians
 
-    //Jacobian velocity w.r.t Rotation body to earth
-    F_k.block<3, 3>(state.vel_error_idx, state.quat_error_idx) = -R * acc_skew;
-    //Jacobian velocity w.r.t. bias_acc
-    F_k.block<3, 3>(state.vel_error_idx, state.ba_error_idx) = -R;
+    // Jacobian velocity w.r.t Rotation body to earth
+    Mat33d dV_dtheta = -R * acc_skew;
+    // Jacobian velocity w.r.t. bias_acc
+    Mat33d dV_daccb = -R;
+    // Rotation Jacobians
 
-    //Rotation Jacobians
+    Mat33d dQ_dtheta = -gyro_skew;
+    Mat33d dQ_dgyrob = -Mat33d::Identity();
 
+    // Position Jacobians
+    Mat33d dP_dv = Mat33d::Identity();
 
-    //Jacobian rotation w.r.t quat
-    F_k.block<3, 3>(state.quat_error_idx, state.quat_error_idx) = -gyro_skew;
-
-    F_k.block<3, 3>(state.quat_error_idx, state.bg_error_idx) = -Mat33d::Identity();
+    // Set the blocks in the F matrix
+    F_k.block<3, 3>(x.pos_error_idx, x.vel_error_idx) = dP_dv;
+    F_k.block<3, 3>(state.quat_error_idx, state.quat_error_idx) = dQ_dtheta;
+    F_k.block<3, 3>(state.quat_error_idx, state.bg_error_idx) = dQ_dgyrob;
+    F_k.block<3, 3>(state.vel_error_idx, state.quat_error_idx) = dV_dtheta;
+    F_k.block<3, 3>(state.vel_error_idx, state.ba_error_idx) = dV_daccb;
 
     double dt;// FIXEME
     MatXd Fdt = F * dt;
@@ -277,13 +394,16 @@ public:
 
     MatXd Phi = Fdt + 0.5 * Fdt2 + (1. / 6.) * Fdt3;
 
-
-    // See equation 246 in Sola. To see why we can ignore rotation in accelerometer noise
     MatXd G_k(15, 12);
 
     G_k.setZero();
 
-    G_k.block<3, 3>(0, 0) = Mat33d::Identity();
+    // Jacobians with respect to noise
+    G_k.block<3, 3>(0, 0) = -Mat33d::Identity(); // dQ_dng
+    G_k.block<3, 3>(3, 3) = Mat33d::Identity(); // dGyroBias_dng
+    G_k.block<3, 3>(6, 6) = -R; // dV_dnacc
+    G_k.block<3, 3>(9, 9) = Mat33d::Identity(); // dAccBias_dnacc
+
 
     MatXd Qc(12, 12);
 
@@ -297,14 +417,14 @@ public:
 
   }
 
-  void UpdateFeatures(const std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> &projs,
-                      const std::vector<int64_t> &ids) {
+  void UpdateFeatures(const std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>>& projs,
+                      const std::vector<int64_t>& ids) {
 
     assert(ids.size() == projs.size());
 
     for (int idx = 0; idx < projs.size(); ++idx) {
       const int64_t id = ids[idx];
-      const Vec2d &proj = projs[idx];
+      const Vec2d& proj = projs[idx];
 
       auto iter = map_id_landmark.find(id);
 
@@ -316,13 +436,13 @@ public:
         l.cam_id_first = latest_cam_id + 1;
         l.cam_id_last = latest_cam_id + 1;
 
-        auto &cur_cam_state = (state.cam_states.back());
+        auto& cur_cam_state = (state.cam_states.back());
         cur_cam_state.landmark_ids.emplace_back(id);
 
       } else {
-        auto &landmark = iter->second;
+        auto& landmark = iter->second;
         landmark.projs.push_back(proj);
-        auto &cur_cam_state = (state.cam_states.back());
+        auto& cur_cam_state = (state.cam_states.back());
         cur_cam_state.landmark_ids.emplace_back(id);
         landmark.cam_id_last = cur_cam_state.cam_id;
       }
@@ -331,8 +451,8 @@ public:
 
 
     //Check if any Features have reached max length and mark them to be removed
-    for (auto &iter: map_id_landmark) {
-      auto &landmark = iter.second;
+    for (auto& iter: map_id_landmark) {
+      auto& landmark = iter.second;
 
       if (landmark.projs.size() > max_track_length) {
         feature_ids_to_remove.insert(landmark.id);
@@ -342,7 +462,7 @@ public:
 
   }
 
-  bool CheckLandMarkValidity(const Landmark_To_Residualize &l) {
+  bool CheckLandMarkValidity(const Landmark_To_Residualize& l) {
     return true;
   }
 
@@ -375,7 +495,7 @@ public:
       std::vector<int64_t> valid_cam_ids;
       for (int idx = 0; idx < l.camera_ids.size(); ++idx) {
         int cam_id = l.camera_ids[idx];
-        for (auto &cam:state.cam_states) {
+        for (auto& cam:state.cam_states) {
           if (cam_id == cam.cam_id) {
             valid_projs.emplace_back(l.projs[idx]);
             valid_cam_ids.emplace_back(cam_id);
@@ -417,61 +537,102 @@ public:
                             2 * total_obs - 3 * num_valid);
     VecXd r_o(2 * total_obs - 3 * num_valid);
 
-    for (auto &track:valid_tracks) {
+    int matrix_index = 0; // The index to navigate the above matrices
+    for (auto& track:valid_tracks) {
+
+      int num_obs = track.landmark.projs.size();
 
       //Calculate Residual
 
-      std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> residuals = ComputeTrackResidual(track);
+      VecXd residuals = ComputeTrackResidual(track);
 
-      MatXd H_o_j, A;
+      // Noise Matrix
+      MatXd R_j = MatXd::Identity(residuals.size() / 2, residuals.size() / 2) * noise_pixel_sigma;
 
-      ComputeJacobians(track);
+      MatXd H_x_j, H_f_j;
 
+      ComputeJacobians(track, H_x_j, H_f_j);
+
+      // Perform the NullSpace Marginilization. Computes A as seen in MSCKF Eq 23
+      Eigen::JacobiSVD<MatXd> svd_helper(H_f_j, Eigen::ComputeFullU | Eigen::ComputeThinV);
+      MatXd A = svd_helper.matrixU().rightCols(H_f_j.rows() - 3);
+
+      MatXd H_o_j = A.transpose() * H_x_j;
+      VecXd r_o_j = A.transpose() * residuals;
+      MatXd R_o_j = A.transpose() * R_j * A;
+
+      assert(r_o_j.size() == (2 * num_obs - 3)); // See MSCKF paper right after Eq 24
+      assert(H_o_j.rows() == r_o_j.rows());
+
+      if (true) { // add the gating test here
+        r_o.segment(matrix_index, r_o_j.size()) = r_o_j;
+        H_o.block(matrix_index, 0, H_o_j.rows(), H_o_j.cols()) = H_o_j;
+        R_o.block(matrix_index, matrix_index, R_o_j.rows(), R_o_j.cols()) = R_o_j;
+
+        matrix_index += H_o_j.rows();
+      }
     }
+    H_o.conservativeResize(matrix_index, H_o.cols());
+    r_o.conservativeResize(matrix_index);
+    R_o.conservativeResize(matrix_index, matrix_index);
+
+    // Perform Measurement Update
+    MeasurementUpdate(H_o, r_o, R_o);
 
   }
 
-  std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> ComputeTrackResidual(Landmark_To_Residualize &track) {
+  VecXd ComputeTrackResidual(Landmark_To_Residualize& track) {
 
-    std::vector<Vec2d, Eigen::aligned_allocator<Vec2d>> residuals(track.landmark.projs.size());
+    VecXd residuals(track.landmark.projs.size() * 2);
 
     int iter = 0;
-    for (int idx = 0; idx < track.landmark.projs.size(); ++idx) {
-      const auto &obs = track.landmark.projs[idx];
+    for (int idx = 0; idx < track.landmark.projs.size(); idx++) {
+      const auto& obs = track.landmark.projs[idx];
       auto cam_id = track.landmark.camera_ids[idx];
 
-      const Vec3d &pt3D = track.landmark.pos_W;
-      const auto &cam_state = track.connected_cams[cam_id];
+      const Vec3d& pt3D = track.landmark.pos_W;
+      const auto& cam_state = track.connected_cams[cam_id];
 
       Mat44d T_wc = BuildTransform(cam_state.quat, cam_state.pos);
       Mat44d T_cw = InvertTransform(T_wc);
       Vec3d p_f_C = T_wc.block<3, 3>(0, 0) * pt3D + T_wc.block<3, 1>(0, 3);
       Vec2d projection = p_f_C.template head<2>() / p_f_C(2);
 
-      residuals[idx] = obs - projection;
+      Vec2d res = obs - projection;
+      residuals[2 * idx] = res[0];
+      residuals[2 * idx + 1] = res[1];
     }
 
     return residuals;
   }
 
-  void ComputeJacobians(Landmark_To_Residualize &track) {
+  void ComputeJacobians(const Landmark_To_Residualize& track, MatXd& H_x_j, MatXd& H_f_j) {
 
     int n_obs = track.landmark.projs.size();
 
-    MatXd H_f_j = MatXd::Zero(2 * n_obs, 3);
-    MatXd H_x_j =
-        MatXd::Zero(2 * n_obs, 15 + 6 * state.cam_states.size());
+    H_f_j = MatXd::Zero(2 * n_obs, 3);
+    H_x_j = MatXd::Zero(2 * n_obs, 15 + 6 * state.cam_states.size());
 
+    Mat33d R_wi = state.GetQuat().toRotationMatrix(); //Rotation of IMU from World
+    Mat33d R_ic = q_IMU_C.toRotationMatrix(); //Rotation of Camera from IMU
 
-    Mat33d R_wi=state.GetQuat().toRotationMatrix(); //Rotation of IMU from World
-    Mat33d R_ic=q_IMU_C.toRotationMatrix(); //Rotation of Camera from IMU
-
+    Mat33d R_wc = R_wi * R_ic;
 
     for (int c_i = 0; c_i < n_obs; c_i++) {
       const int64_t cam_id = track.landmark.camera_ids[c_i];
 
-      const Vec3d &pt3D = track.landmark.pos_W;
-      const auto &camera_state = track.connected_cams[cam_id];
+      const Vec3d& pt3D = track.landmark.pos_W;
+      const auto& camera_state = track.connected_cams.at(cam_id); // need at for const
+
+      // Find index of camera in current list
+      int cam_index = -1;
+      for (int idx = 0; idx < state.cam_states.size(); ++idx) {
+        if (state.cam_states[idx].cam_id == cam_id) {
+          cam_index = idx;
+          break;
+        }
+      }
+      assert(cam_index != -1);
 
       Vec3d p_f_C = camera_state.quat.toRotationMatrix() *
           (pt3D - camera_state.pos);
@@ -482,63 +643,37 @@ public:
       Y = p_f_C(1);
       Z = p_f_C(2);
 
-      //See Jacobian in MSCKF paper. Also is same in VINS-Mono Projection Factor
+      // See Jacobian in MSCKF paper. Also is same in VINS-Mono Projection Factor
       Eigen::Matrix<double, 2, 3> J_i;
       J_i << 1, 0, -X / Z,
-             0, 1, -Y / Z;
+          0, 1, -Y / Z;
       J_i *= 1 / Z;
-
-
-
-      // P_c= T_cw*P_w and T_cw= T_ci*T_iw
-      // P_c = R_cw*P_w+ t_wc
-      //
 
       Eigen::Matrix<double, 3, 6> dPcam_dstate = Eigen::Matrix<double, 3, 6>::Zero();
 
       // Jacobian w.r.t. Camera Orientation
-      dPcam_dstate.leftCols(3) = R_ic.transpose()*R_wi.transpose()* -CreateSkew(camera_state.pos);
+      dPcam_dstate.leftCols(3) = -R_wc.transpose();
 
       // Jacobian w.r.t. Camera Position
-      dPcam_dstate.rightCols(3) = -(R_ic.transpose()*R_wi.transpose());
+      dPcam_dstate.rightCols(3) = CreateSkew(p_f_C);
 
+      Eigen::Matrix<double, 2, 6> Jac = J_i * dPcam_dstate;
 
-      MatXd Jac=J_i*dPcam_dstate;
+      // Jacobian w.r.t to the point in world
+      Eigen::Matrix<double, 2, 3> dPc_dPw = J_i * R_wc.transpose();
 
-
-//      // Enforce observability constraint, see propagation for citation
-//      Eigen::Matrix<double,2,6> A;
-//      A << J_i * vectorToSkewSymmetric(p_f_C),
-//          -J_i * cam_states_[index].q_CG.toRotationMatrix();
-//
-//      Eigen::Matrix<double,6,1> u = Matrix<_S, 6, 1>::Zero();
-//      u.head(3) = cam_states_[index].q_CG.toRotationMatrix() * imu_state_.g;
-//      Vector3<_S> tmp = p_f_G - cam_states_[index].p_C_G;
-//      u.tail(3) = vectorToSkewSymmetric(tmp) * imu_state_.g;
-//
-//      Matrix<_S, 2, 6> H_x =
-//          A - A * u * (u.transpose() * u).inverse() * u.transpose();
-//      Matrix<_S, 2, 3> H_f = -H_x.template block<2, 3>(0, 3);
-//      H_f_j.template block<2, 3>(2 * c_i, 0) = H_f;
-//
-//      // Potential indexing problem zone
-//      H_x_j.template block<2, 6>(2 * c_i, 15 + 6 * (index)) = H_x;
-//    }
-//
-//    int jacobian_row_size = 2 * camStateIndices.size();
-//
-//    JacobiSVD<MatrixX<_S>> svd_helper(H_f_j, ComputeFullU | ComputeThinV);
-//    A_j = svd_helper.matrixU().rightCols(jacobian_row_size - 3);
-//
-//    H_o_j = A_j.transpose() * H_x_j;
+      if (use_observability_augmentation) {
+        return;
+      } else {
+        H_f_j.block<2, 3>(2 * c_i, 0) = dPc_dPw;
+        H_x_j.block<2, 6>(2 * c_i, 15 + 6 * (cam_index)) = Jac;
+      }
     }
-
   }
 
-  bool TriangulateFeature(Landmark_To_Residualize &track);
+  bool TriangulateFeature(Landmark_To_Residualize& track);
 
-  /*
-  void MeasurementUpdate(const MatXd &H_o, const MatXd &r_o, const MatXd &R_o) {
+  void MeasurementUpdate(const MatXd& H_o, const MatXd& r_o, const MatXd& R_o) {
     if (r_o.size() != 0) {
       // Build MSCKF covariance matrix
       MatXd P = MatXd::Zero(15 + state.cams_covar.rows(), 15 + state.cams_covar.cols());
@@ -554,7 +689,7 @@ public:
 
       // Put residuals in update-worthy form
       // Calculates T_H matrix according to Mourikis 2007
-      Eigen::HouseholderQR <MatXd> qr(H_o);
+      Eigen::HouseholderQR<MatXd> qr(H_o);
       MatXd Q = qr.householderQ();
       MatXd R = qr.matrixQR().template triangularView<Eigen::Upper>();
 
@@ -635,18 +770,11 @@ public:
     } else
       return;
   }
-*/
-   
+
   void AugmentState() {
-
-    int n_cams = state.cam_states.size();
-
-
     // T_wc = T_wi*T_ic
     // w=world,c=camera,i=imu/body
     // T=Rt
-
-    // From above
     // Q_wc=Q_wi*Q_ic
     Eigen::Quaterniond cam_quat = state.GetQuat() * q_IMU_C; //
     cam_quat.normalize(); // ensure it is unit quaternion
@@ -674,32 +802,26 @@ public:
       state.P = state.imu_covar;
     }
 
-
-    //Size is 6 since minimal Jacobian pose is 6(quat=3,pos=3)
+    // Size is 6 since minimal Jacobian pose is 6(quat=3,pos=3)
 
     MatXd Jac = MatXd::Zero(6, 15 + 6 * state.cam_states.size());
 
+    // Follows the format seen in Mourikis MSCKF Eq 16
+    // Jacobians are with Body to Earth using Q_wc=Q_wi*Q_ic and t_wc= t_wi+ R_wi*t_ic
 
-    //Follows the format seen in Mourikis MSCKF Eq 16
-    //Jacobians are with Body to Earth using Q_wc=Q_wi*Q_ic and t_wc= t_wi+ R_wi*t_ic
+    Mat33d dQC_dQI = q_IMU_C.toRotationMatrix(); // Jac of cam_quat w.r.t imu_quat
 
-
-
-
-    //Quaternion Jacs
-    // Jac of cam_quat w.r.t imu_quat
-    Jac.block<3, 3>(0, state.quat_error_idx) = q_IMU_C.toRotationMatrix();
-
-
-    //Position Jac
-
-    //Jac of cam_position with respect to imu_quat d/dR(R_wi*t_ic)
-    //derivative of this can be found in Bloesh primer
     Mat33d s = CreateSkew(p_IMU_C);
-    Jac.block<3, 3>(3, state.quat_error_idx) = -state.GetQuat().toRotationMatrix() * s;
+    Mat33d dPC_dQI = -state.GetQuat().toRotationMatrix() * s; // Jac of cam_position with respect to imu_quat
+    // derivative of this can be found in Bloesh primer
 
-    //Jac of cam_position w.r.t position
-    Jac.block<3, 3>(3, state.pos_error_idx) = Mat33d::Identity();
+    Mat33d dPC_dPI = Mat33d::Identity(); // Jac of cam_position w.r.t imu position
+
+    Jac.block<3, 3>(0, state.quat_error_idx) = dQC_dQI;
+    Jac.block<3, 3>(3, state.quat_error_idx) = dPC_dQI;
+    Jac.block<3, 3>(3, state.pos_error_idx) = dPC_dPI;
+
+    int n_cams = state.cam_states.size();
 
     MatXd tempMat = MatXd::Identity(15 + 6 * n_cams + 6,
                                     15 + 6 * n_cams);
@@ -720,14 +842,5 @@ public:
   }
 
 };
-
-
-
-//void RungeKutta4(std::function<VecXd(const VecXd&,const VecXd&,double)> compute_xdot,VecXdVecXd& out){
-//
-//    VecXd k1=compute_xdot()
-//
-//
-//}
 
 }

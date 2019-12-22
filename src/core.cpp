@@ -1,11 +1,7 @@
-//
-// Created by niko on 12/6/19.
-//
-
 #include "core.h"
 
-
 namespace msckf{
+
 Eigen::Quaterniond RotVec2Quat(const Vec3d &rot_vec) {
   double theta = rot_vec.norm();
   if (theta < 1e-10) {
@@ -48,7 +44,32 @@ Mat44d InvertTransform(const Mat44d &transform) {
   Tinv.block<3,1>(0,3) = -Tinv.block<3,3>(0,0)*transform.block<3,1>(0,3);
   return Tinv;
 }
+Mat44d Omega(const Vec3d& gyro_meas) {
+  Mat44d omega;
+  double wx = gyro_meas(0);
+  double wy = gyro_meas(1);
+  double wz = gyro_meas(2);
+  omega <<
+        0, -wx, -wy, -wz,
+      wx, 0, wz, -wy,
+      wy, -wz, 0, wx,
+      wz, wy, -wx, 0;
+  return omega;
 
+}
 
+Mat44d OmegaEigenQuat(const Vec3d& gyro_meas) {
+  Mat44d omega;
+  double wx = gyro_meas(0);
+  double wy = gyro_meas(1);
+  double wz = gyro_meas(2);
+  omega <<
+        -wx, -wy, -wz, 0,
+      0, wz, -wy, wx,
+      -wz, 0, wx, wy,
+      wy, -wx, 0, wz;
+  return omega;
+
+}
 
 }
